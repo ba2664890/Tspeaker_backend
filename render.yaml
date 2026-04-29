@@ -1,0 +1,48 @@
+services:
+  # ─── API Web (Django) ──────────────────────────────────────────────────────
+  - type: web
+    name: tspeak-api
+    env: python
+    buildCommand: "pip install -r requirements.txt" # Utilisé si Docker n'est pas activé, mais on préfère Docker
+    startCommand: "./scripts/render-start.sh"
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: core.settings
+      - key: DEBUG
+        value: "False"
+      - key: PYTHON_VERSION
+        value: 3.12.0
+    # On utilise ici le Dockerfile pour plus de contrôle sur FFmpeg
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/content/categories/ # Un endpoint public simple pour le healthcheck
+
+  # ─── Celery Worker (Traitement Audio) ────────────────────────────────────
+  - type: worker
+    name: tspeak-worker
+    env: docker
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: "celery -A core.celery worker --loglevel=info --queues=audio,default --concurrency=2"
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: core.settings
+
+  # ─── Celery Beat (Tâches Périodiques) ─────────────────────────────────────
+  - type: worker
+    name: tspeak-beat
+    env: docker
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: "celery -A core.celery beat --loglevel=info"
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: core.settings
+
+  # ─── Redis (Broker) ───────────────────────────────────────────────────────
+  - type: redis
+    name: tspeak-redis
+    ipAllowList: [] # Allow all internal traffic
+    plan: free # Ou starter selon tes besoins
+
+# Note : Pense à configurer DATABASE_URL et REDIS_URL dans le tableau de bord Render

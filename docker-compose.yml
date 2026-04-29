@@ -48,25 +48,20 @@ services:
   tspeak-api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Dockerfile
     container_name: tspeak-api
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings
-      - SECRET_KEY=${SECRET_KEY}
-      - DEBUG=${DEBUG:-False}
+      - SECRET_KEY=${SECRET_KEY:-dev_key_for_testing_only_replace_me}
+      - DEBUG=${DEBUG:-True}
       - DB_HOST=tspeak-db
       - DB_NAME=tspeak_db
       - DB_USER=tspeak_user
       - DB_PASSWORD=${DB_PASSWORD:-tspeak_secure_2024}
-      - REDIS_URL=redis://tspeak-redis:6379
-      - LLM_API_KEY=${LLM_API_KEY}
-      - SENTRY_DSN=${SENTRY_DSN:-}
-      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
-      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - REDIS_URL=redis://tspeak-redis:6379/1
     volumes:
       - ./:/app
       - media_data:/app/media
-      - ./logs:/app/logs
     ports:
       - "8000:8000"
     depends_on:
@@ -74,81 +69,50 @@ services:
         condition: service_healthy
       tspeak-redis:
         condition: service_healthy
-    command: >
-      sh -c "python manage.py migrate --noinput &&
-             python manage.py collectstatic --noinput &&
-             gunicorn core.wsgi:application
-             --bind 0.0.0.0:8000
-             --workers 4
-             --worker-class gthread
-             --threads 2
-             --timeout 120
-             --access-logfile -
-             --error-logfile -"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    command: /app/scripts/render-start.sh
     restart: unless-stopped
 
   # ─── Celery Worker (traitement audio) ─────────────────────────────────────
   tspeak-worker:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Dockerfile
     container_name: tspeak-worker
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings
-      - SECRET_KEY=${SECRET_KEY}
+      - SECRET_KEY=${SECRET_KEY:-dev_key_for_testing_only_replace_me}
       - DB_HOST=tspeak-db
-      - DB_NAME=tspeak_db
-      - DB_USER=tspeak_user
-      - DB_PASSWORD=${DB_PASSWORD:-tspeak_secure_2024}
-      - REDIS_URL=redis://tspeak-redis:6379
-      - LLM_API_KEY=${LLM_API_KEY}
-      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
-      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - REDIS_URL=redis://tspeak-redis:6379/1
     volumes:
       - ./:/app
       - media_data:/app/media
-      - /tmp/tspeak_audio:/tmp/tspeak_audio
-      - ./models:/app/models  # Modèles fine-tunés
     depends_on:
-      - tspeak-db
-      - tspeak-redis
-    command: >
-      celery -A core.celery worker
-      --loglevel=info
-      --queues=audio,default
-      --concurrency=4
-      --max-tasks-per-child=100
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+      tspeak-db:
+        condition: service_healthy
+      tspeak-redis:
+        condition: service_healthy
+    command: celery -A core.celery worker --loglevel=info --queues=audio,default
     restart: unless-stopped
 
   # ─── Celery Beat (tâches périodiques) ─────────────────────────────────────
   tspeak-beat:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Dockerfile
     container_name: tspeak-beat
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings
-      - SECRET_KEY=${SECRET_KEY}
+      - SECRET_KEY=${SECRET_KEY:-dev_key_for_testing_only_replace_me}
       - DB_HOST=tspeak-db
-      - REDIS_URL=redis://tspeak-redis:6379
+      - REDIS_URL=redis://tspeak-redis:6379/1
     volumes:
       - ./:/app
     depends_on:
-      - tspeak-db
-      - tspeak-redis
-    command: celery -A core.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+      tspeak-db:
+        condition: service_healthy
+      tspeak-redis:
+        condition: service_healthy
+    command: celery -A core.celery beat --loglevel=info
     restart: unless-stopped
 
   # ─── Nginx (reverse proxy) ────────────────────────────────────────────────
