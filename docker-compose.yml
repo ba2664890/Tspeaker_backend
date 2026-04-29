@@ -1,0 +1,179 @@
+version: "3.9"
+
+services:
+  # ─── Base de données PostgreSQL ───────────────────────────────────────────
+  tspeak-db:
+    image: postgres:15-alpine
+    container_name: tspeak-db
+    environment:
+      POSTGRES_DB: tspeak_db
+      POSTGRES_USER: tspeak_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-tspeak_secure_2024}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tspeak_user -d tspeak_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── Redis ────────────────────────────────────────────────────────────────
+  tspeak-redis:
+    image: redis:7-alpine
+    container_name: tspeak-redis
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 3600 1
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── API Django ───────────────────────────────────────────────────────────
+  tspeak-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: tspeak-api
+    environment:
+      - DJANGO_SETTINGS_MODULE=core.settings
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG:-False}
+      - DB_HOST=tspeak-db
+      - DB_NAME=tspeak_db
+      - DB_USER=tspeak_user
+      - DB_PASSWORD=${DB_PASSWORD:-tspeak_secure_2024}
+      - REDIS_URL=redis://tspeak-redis:6379
+      - LLM_API_KEY=${LLM_API_KEY}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+    volumes:
+      - ./:/app
+      - media_data:/app/media
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      tspeak-db:
+        condition: service_healthy
+      tspeak-redis:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn core.wsgi:application
+             --bind 0.0.0.0:8000
+             --workers 4
+             --worker-class gthread
+             --threads 2
+             --timeout 120
+             --access-logfile -
+             --error-logfile -"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ─── Celery Worker (traitement audio) ─────────────────────────────────────
+  tspeak-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: tspeak-worker
+    environment:
+      - DJANGO_SETTINGS_MODULE=core.settings
+      - SECRET_KEY=${SECRET_KEY}
+      - DB_HOST=tspeak-db
+      - DB_NAME=tspeak_db
+      - DB_USER=tspeak_user
+      - DB_PASSWORD=${DB_PASSWORD:-tspeak_secure_2024}
+      - REDIS_URL=redis://tspeak-redis:6379
+      - LLM_API_KEY=${LLM_API_KEY}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+    volumes:
+      - ./:/app
+      - media_data:/app/media
+      - /tmp/tspeak_audio:/tmp/tspeak_audio
+      - ./models:/app/models  # Modèles fine-tunés
+    depends_on:
+      - tspeak-db
+      - tspeak-redis
+    command: >
+      celery -A core.celery worker
+      --loglevel=info
+      --queues=audio,default
+      --concurrency=4
+      --max-tasks-per-child=100
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ─── Celery Beat (tâches périodiques) ─────────────────────────────────────
+  tspeak-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: tspeak-beat
+    environment:
+      - DJANGO_SETTINGS_MODULE=core.settings
+      - SECRET_KEY=${SECRET_KEY}
+      - DB_HOST=tspeak-db
+      - REDIS_URL=redis://tspeak-redis:6379
+    volumes:
+      - ./:/app
+    depends_on:
+      - tspeak-db
+      - tspeak-redis
+    command: celery -A core.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    restart: unless-stopped
+
+  # ─── Nginx (reverse proxy) ────────────────────────────────────────────────
+  tspeak-nginx:
+    image: nginx:alpine
+    container_name: tspeak-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - media_data:/app/media:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - tspeak-api
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  media_data:
+    driver: local
+
+networks:
+  default:
+    name: tspeak-network
+    driver: bridge
