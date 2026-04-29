@@ -98,11 +98,20 @@ DATABASES = {
 }
 
 # ─── Cache & Redis ───────────────────────────────────────────────────────────
-REDIS_URL = config("REDIS_URL", default="redis://127.0.0.1:6379")
+# Sur Render, on privilégie os.environ pour être sûr de capter les variables injectées
+REDIS_URL = os.environ.get("REDIS_URL") or config("REDIS_URL", default="redis://127.0.0.1:6379")
 CACHE_BACKEND = config("CACHE_BACKEND", default="redis")
 
-# Nettoyage du REDIS_URL pour éviter les doubles slashes lors de l'ajout de l'index
+# Détection de l'environnement Render
+IS_RENDER = os.environ.get("RENDER", "False") == "True"
+
+# Nettoyage du REDIS_URL
 _cleaned_redis_url = REDIS_URL.rstrip('/')
+
+# Si on est sur Render mais que le REDIS_URL pointe sur localhost, c'est une erreur de config
+if IS_RENDER and "127.0.0.1" in _cleaned_redis_url:
+    print("⚠️ WARNING: REDIS_URL pointing to localhost on Render. Falling back to LocMem to avoid 500 errors.")
+    CACHE_BACKEND = "locmem"
 
 if CACHE_BACKEND == "locmem":
     CACHES = {
