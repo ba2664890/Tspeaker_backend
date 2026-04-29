@@ -70,7 +70,14 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
             duration_sec=exchange.user_audio_duration_sec,
         )
 
-        # ── Étape 4 : Génération feedback LLM ─────────────────────────────
+        # ── Étape 4 : Analyse grammaire + vocabulaire ────────────────────
+        from ai.wav2vec_scoring.nlp_analyzer import GrammarAnalyzer, VocabularyAnalyzer
+        grammar_analysis = GrammarAnalyzer().analyze(transcription)
+        vocabulary_analysis = VocabularyAnalyzer().analyze(transcription)
+        grammar_score = grammar_analysis["grammar_score"]
+        vocabulary_score = vocabulary_analysis["vocabulary_score"]
+
+        # ── Étape 5 : Génération feedback LLM ─────────────────────────────
         from ai.llm_conversation.generator import ConversationGenerator
         generator = ConversationGenerator()
         session = exchange.session
@@ -86,7 +93,7 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
             history=history,
         )
 
-        # ── Étape 5 : Sauvegarde ──────────────────────────────────────────
+        # ── Étape 6 : Sauvegarde ──────────────────────────────────────────
         processing_ms = int((time.monotonic() - start_time) * 1000)
 
         exchange.transcription = transcription
@@ -98,6 +105,19 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
         exchange.processing_time_ms = processing_ms
         exchange.save()
 
+        from apps.scoring.models import Score
+        score, _ = Score.objects.update_or_create(
+            session=session,
+            defaults={
+                "user": session.user,
+                "pronunciation": pronunciation_score,
+                "fluency": fluency_score,
+                "grammar": grammar_score,
+                "vocabulary": vocabulary_score,
+                "feedback_text": llm_response["feedback"],
+            },
+        )
+
         # Mettre à jour le statut de la session
         session.status = "active"
         session.save(update_fields=["status"])
@@ -108,9 +128,14 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
             "transcription": transcription,
             "pronunciation_score": pronunciation_score,
             "fluency_score": fluency_score,
+            "grammar_score": grammar_score,
+            "vocabulary_score": vocabulary_score,
+            "global_score": float(score.global_score),
             "ai_feedback": llm_response["feedback"],
             "ai_response": llm_response["next_question"],
             "phoneme_analysis": phoneme_analysis,
+            "grammar_analysis": grammar_analysis,
+            "vocabulary_analysis": vocabulary_analysis,
             "processing_time_ms": processing_ms,
         }
         cache.set(f"exchange_result:{exchange_id}", result_data, timeout=600)

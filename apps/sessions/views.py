@@ -224,6 +224,16 @@ class AudioResultView(generics.RetrieveAPIView):
             "phoneme_analysis": exchange.phoneme_analysis,
             "processing_time_ms": exchange.processing_time_ms,
         }
+        score = getattr(exchange.session, "score", None)
+        if score is not None:
+            data.update(
+                {
+                    "grammar_score": float(score.grammar or 0),
+                    "vocabulary_score": float(score.vocabulary or 0),
+                    "global_score": float(score.global_score or 0),
+                    "feedback_text": score.feedback_text,
+                }
+            )
         # Mettre en cache 10 minutes
         cache.set(cache_key, data, timeout=600)
         return Response({"success": True, "status": "completed", "data": data})

@@ -39,7 +39,8 @@ def api_client():
 def user(db):
     return User.objects.create_user(
         email="test@tspeak.africa",
-        full_name="Amadou Diallo",
+        first_name="Amadou",
+        last_name="Diallo",
         password="TestPass123!",
         native_language="wolof",
         level="beginner",
@@ -51,7 +52,8 @@ def user(db):
 def premium_user(db):
     return User.objects.create_user(
         email="premium@tspeak.africa",
-        full_name="Fatou Sow",
+        first_name="Fatou",
+        last_name="Sow",
         password="TestPass123!",
         native_language="wolof",
         is_premium=True,
@@ -100,7 +102,8 @@ class TestAuthentication:
         url = reverse("auth-register")
         data = {
             "email": "new@tspeak.africa",
-            "full_name": "Cheikh Ba",
+            "first_name": "Cheikh",
+            "last_name": "Ba",
             "password": "SecurePass123!",
             "password_confirm": "SecurePass123!",
             "native_language": "wolof",
@@ -117,7 +120,8 @@ class TestAuthentication:
         url = reverse("auth-register")
         data = {
             "email": "nogdpr@test.com",
-            "full_name": "Test User",
+            "first_name": "Test",
+            "last_name": "User",
             "password": "SecurePass123!",
             "password_confirm": "SecurePass123!",
             "gdpr_consent": False,
@@ -129,7 +133,8 @@ class TestAuthentication:
         url = reverse("auth-register")
         data = {
             "email": "test@test.com",
-            "full_name": "Test",
+            "first_name": "Test",
+            "last_name": "Mismatch",
             "password": "Pass123!",
             "password_confirm": "DifferentPass!",
             "gdpr_consent": True,
@@ -161,7 +166,7 @@ class TestAuthentication:
 
     def test_update_profile(self, auth_client):
         url = reverse("auth-me")
-        response = auth_client.patch(url, {"full_name": "Nouveau Nom"}, format="json")
+        response = auth_client.patch(url, {"first_name": "Nouveau", "last_name": "Nom"}, format="json")
         assert response.status_code == status.HTTP_200_OK
         assert response.data["data"]["full_name"] == "Nouveau Nom"
 
@@ -176,6 +181,24 @@ class TestAuthentication:
         assert response.status_code == status.HTTP_200_OK
         assert "streak_days" in response.data
         assert response.data["streak_days"] == 1
+
+    def test_login_view_uses_scoped_throttle(self):
+        from rest_framework.throttling import ScopedRateThrottle
+        from apps.users.views import LoginView
+
+        assert LoginView.throttle_scope == "login"
+        assert LoginView.throttle_classes == [ScopedRateThrottle]
+
+    def test_throttled_errors_include_retry_after(self):
+        from rest_framework.exceptions import Throttled
+        from core.exceptions import custom_exception_handler
+
+        response = custom_exception_handler(Throttled(wait=8), {})
+
+        assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+        assert response.data["success"] is False
+        assert response.data["error"]["code"] == "THROTTLED"
+        assert response.data["retry_after"] == 8
 
 
 # ─── Tests Sessions ───────────────────────────────────────────────────────────
@@ -432,6 +455,120 @@ class TestFluencyScore:
         assert score < 60.0
 
 
+@pytest.mark.django_db
+class TestLeaderboard:
+
+    def test_weekly_leaderboard_returns_rich_payload(self, auth_client, user):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.sessions.models import VocalSession
+
+        user.xp_total = 1800
+        user.streak_days = 5
+        user.sessions_count = 8
+        user.avg_pronunciation = 82
+        user.avg_fluency = 76
+        user.avg_grammar = 80
+        user.avg_vocabulary = 78
+        user.save()
+
+        rival = User.objects.create_user(
+            email="rival@tspeak.africa",
+            first_name="Awa",
+            last_name="Diop",
+            password="TestPass123!",
+            native_language="french",
+            gdpr_consent=True,
+            xp_total=2200,
+            streak_days=4,
+            sessions_count=10,
+        )
+        outsider = User.objects.create_user(
+            email="outsider@tspeak.africa",
+            first_name="Moussa",
+            last_name="Ba",
+            password="TestPass123!",
+            native_language="wolof",
+            gdpr_consent=True,
+            xp_total=4200,
+            streak_days=2,
+            sessions_count=16,
+        )
+
+        recent = timezone.now() - timedelta(days=2)
+        old = timezone.now() - timedelta(days=12)
+
+        session_me = VocalSession.objects.create(
+            user=user,
+            session_type="conversation",
+            scenario="pitch",
+            status="completed",
+            xp_earned=180,
+        )
+        session_me.created_at = recent
+        session_me.save(update_fields=["created_at"])
+
+        session_rival = VocalSession.objects.create(
+            user=rival,
+            session_type="conversation",
+            scenario="meeting",
+            status="completed",
+            xp_earned=240,
+        )
+        session_rival.created_at = recent
+        session_rival.save(update_fields=["created_at"])
+
+        session_outsider = VocalSession.objects.create(
+            user=outsider,
+            session_type="conversation",
+            scenario="old",
+            status="completed",
+            xp_earned=500,
+        )
+        session_outsider.created_at = old
+        session_outsider.save(update_fields=["created_at"])
+
+        response = auth_client.get(f"{reverse('auth-leaderboard')}?scope=weekly")
+        assert response.status_code == status.HTTP_200_OK
+
+        payload = response.data["data"]
+        assert payload["summary"]["scope"] == "weekly"
+        assert payload["summary"]["score_label"] == "XP semaine"
+        assert payload["current_user"]["is_current_user"] is True
+        assert payload["current_user"]["rank"] == 2
+        assert payload["podium"][0]["name"] == "Awa Diop"
+        assert payload["podium"][1]["name"] == "Amadou Diallo"
+        assert any(entry["is_current_user"] for entry in payload["around_me"])
+
+    def test_global_leaderboard_uses_total_xp(self, auth_client, user):
+        champion = User.objects.create_user(
+            email="champion@tspeak.africa",
+            first_name="Zeynab",
+            last_name="Fall",
+            password="TestPass123!",
+            native_language="french",
+            gdpr_consent=True,
+            xp_total=6400,
+            streak_days=9,
+            sessions_count=22,
+        )
+
+        user.xp_total = 2100
+        user.streak_days = 3
+        user.sessions_count = 9
+        user.save()
+
+        response = auth_client.get(f"{reverse('auth-leaderboard')}?scope=global")
+        assert response.status_code == status.HTTP_200_OK
+
+        payload = response.data["data"]
+        assert payload["summary"]["scope"] == "global"
+        assert payload["summary"]["top_score"] == 6400
+        assert payload["podium"][0]["name"] == "Zeynab Fall"
+        assert payload["current_user"]["league"] == "Pionnier"
+        assert payload["current_user"]["is_current_user"] is True
+
+
 # ─── Tests Performance & Cache ────────────────────────────────────────────────
 
 @pytest.mark.django_db
@@ -458,7 +595,7 @@ class TestCaching:
         assert cache.get(f"user_profile:{user.id}") is not None
 
         # Mise à jour → doit invalider le cache
-        auth_client.patch(profile_url, {"full_name": "Nouveau Nom"}, format="json")
+        auth_client.patch(profile_url, {"first_name": "Nouveau", "last_name": "Nom"}, format="json")
         assert cache.get(f"user_profile:{user.id}") is None
 
 

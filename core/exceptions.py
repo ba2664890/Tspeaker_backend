@@ -1,7 +1,9 @@
 from rest_framework.views import exception_handler
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.exceptions import Throttled
 import logging
+import math
 
 logger = logging.getLogger("tspeak.api")
 
@@ -26,6 +28,16 @@ def custom_exception_handler(exc, context):
 
     # Enrichir la réponse d'erreur de DRF si nécessaire
     if response.status_code >= 400:
+        if isinstance(exc, Throttled):
+            wait = math.ceil(exc.wait) if exc.wait is not None else None
+            response.data = {
+                "success": False,
+                "error": {
+                    "code": "THROTTLED",
+                    "message": str(response.data.get("detail", "Requête ralentie.")),
+                },
+                "retry_after": wait,
+            }
         logger.warning(f"Erreur API ({response.status_code}): {response.data}")
     
     return response

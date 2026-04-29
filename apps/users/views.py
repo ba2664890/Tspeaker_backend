@@ -1,15 +1,20 @@
 """T.Speak — Vues Authentification & Profil utilisateur"""
 
 import logging
+from datetime import timedelta
+
 from django.core.cache import cache
+from django.db.models import Count, IntegerField, Q, Sum, Value
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework import generics, status, permissions
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
-from drf_spectacular.utils import extend_schema, OpenApiResponse
+from drf_spectacular.utils import extend_schema, OpenApiParameter
 
 from .models import User, Badge
 from .serializers import (
@@ -18,10 +23,266 @@ from .serializers import (
     UserProfileSerializer,
     UserProfileUpdateSerializer,
     BadgeSerializer,
-    LeaderboardEntrySerializer,
+    LeaderboardResponseSerializer,
 )
 
 logger = logging.getLogger("tspeak.auth")
+
+
+LEVEL_MAP = {
+    "beginner": 1,
+    "elementary": 2,
+    "intermediate": 3,
+    "upper_intermediate": 4,
+    "advanced": 5,
+}
+
+LEAGUE_TIERS = [
+    {"name": "Éclosion", "min_xp": 0},
+    {"name": "Impulsion", "min_xp": 500},
+    {"name": "Pionnier", "min_xp": 1500},
+    {"name": "Virtuose", "min_xp": 3500},
+    {"name": "Élite", "min_xp": 7500},
+    {"name": "Légende", "min_xp": 12000},
+]
+
+
+def _user_display_name(row):
+    name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+    if name:
+        return name
+
+    email = row.get("email", "")
+    if email:
+        return email.split("@", 1)[0]
+
+    return "Apprenant T.Speak"
+
+
+def _league_meta(total_xp):
+    current = LEAGUE_TIERS[0]
+    next_tier = None
+
+    for index, tier in enumerate(LEAGUE_TIERS):
+        if total_xp >= tier["min_xp"]:
+            current = tier
+            next_tier = LEAGUE_TIERS[index + 1] if index + 1 < len(LEAGUE_TIERS) else None
+        else:
+            break
+
+    current_floor = current["min_xp"]
+    next_target = next_tier["min_xp"] if next_tier else total_xp
+
+    if not next_tier or next_target <= current_floor:
+        progress = 1.0
+        remaining = 0
+    else:
+        progress = (total_xp - current_floor) / (next_target - current_floor)
+        progress = max(0.0, min(progress, 1.0))
+        remaining = max(0, next_target - total_xp)
+
+    return {
+        "current_league": current["name"],
+        "next_league": next_tier["name"] if next_tier else "",
+        "league_progress": round(progress, 4),
+        "next_league_target": next_target,
+        "score_to_next_league": remaining,
+    }
+
+
+def _scope_meta(scope):
+    if scope == "global":
+        return {
+            "scope": "global",
+            "scope_label": "Global",
+            "scope_description": "Le classement cumulé sur toute l'aventure T.Speak.",
+            "score_label": "XP total",
+        }
+
+    return {
+        "scope": "weekly",
+        "scope_label": "Hebdomadaire",
+        "scope_description": "Les XP gagnés sur les 7 derniers jours.",
+        "score_label": "XP semaine",
+    }
+
+
+def _build_leaderboard_snapshot(scope):
+    cache_key = f"leaderboard:{scope}"
+    cached_snapshot = cache.get(cache_key)
+    if cached_snapshot:
+        return cached_snapshot
+
+    queryset = User.objects.filter(is_active=True)
+
+    if scope == "global":
+        queryset = queryset.annotate(
+            ranking_xp=Coalesce("xp_total", Value(0), output_field=IntegerField()),
+            activity_sessions=Coalesce("sessions_count", Value(0), output_field=IntegerField()),
+        )
+    else:
+        cutoff = timezone.now() - timedelta(days=7)
+        queryset = queryset.annotate(
+            ranking_xp=Coalesce(
+                Sum(
+                    "sessions__xp_earned",
+                    filter=Q(
+                        sessions__status="completed",
+                        sessions__created_at__gte=cutoff,
+                    ),
+                ),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            activity_sessions=Coalesce(
+                Count(
+                    "sessions",
+                    filter=Q(
+                        sessions__status="completed",
+                        sessions__created_at__gte=cutoff,
+                    ),
+                    distinct=True,
+                ),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+        )
+
+    raw_rows = queryset.values(
+        "id",
+        "email",
+        "first_name",
+        "last_name",
+        "avatar_url",
+        "xp_total",
+        "level",
+        "streak_days",
+        "sessions_count",
+        "avg_pronunciation",
+        "avg_fluency",
+        "avg_grammar",
+        "avg_vocabulary",
+        "ranking_xp",
+        "activity_sessions",
+        "date_joined",
+    ).order_by("-ranking_xp", "-streak_days", "-activity_sessions", "date_joined")
+
+    entries = []
+    for rank, row in enumerate(raw_rows, start=1):
+        total_xp = int(row["xp_total"] or 0)
+        ranking_xp = int(row["ranking_xp"] or 0)
+        average_score = round(
+            (
+                float(row["avg_pronunciation"] or 0)
+                + float(row["avg_fluency"] or 0)
+                + float(row["avg_grammar"] or 0)
+                + float(row["avg_vocabulary"] or 0)
+            ) / 4,
+            1,
+        )
+        league = _league_meta(total_xp)
+
+        entries.append(
+            {
+                "id": str(row["id"]),
+                "rank": rank,
+                "name": _user_display_name(row),
+                "avatar_url": row["avatar_url"] or "",
+                "xp": ranking_xp,
+                "total_xp": total_xp,
+                "level": row["level"] or "beginner",
+                "level_number": LEVEL_MAP.get(row["level"], 1),
+                "league": league["current_league"],
+                "streak_days": int(row["streak_days"] or 0),
+                "sessions_count": int(row["activity_sessions"] or row["sessions_count"] or 0),
+                "average_score": average_score,
+            }
+        )
+
+    snapshot = {
+        "entries": entries,
+        "generated_at": timezone.now(),
+        "meta": _scope_meta(scope),
+        "top_score": entries[0]["xp"] if entries else 0,
+        "best_streak": max((entry["streak_days"] for entry in entries), default=0),
+    }
+    cache.set(cache_key, snapshot, timeout=300)
+    return snapshot
+
+
+def _with_current_flag(entry, current_user_id):
+    return {
+        **entry,
+        "is_current_user": entry["id"] == current_user_id,
+    }
+
+
+def _leaderboard_payload_for_user(user, scope):
+    snapshot = _build_leaderboard_snapshot(scope)
+    entries = snapshot["entries"]
+    current_user_id = str(user.id)
+    current_index = next(
+        (index for index, entry in enumerate(entries) if entry["id"] == current_user_id),
+        None,
+    )
+
+    current_user = _with_current_flag(entries[current_index], current_user_id) if current_index is not None else None
+    podium = [_with_current_flag(entry, current_user_id) for entry in entries[:3]]
+    leaderboard = [_with_current_flag(entry, current_user_id) for entry in entries[:20]]
+
+    if current_index is None:
+        around_me = []
+        target_entry = None
+        chaser_entry = None
+        current_league = _league_meta(user.xp_total)
+        user_rank = 0
+        current_score = 0
+        current_total_xp = user.xp_total
+    else:
+        start = max(0, current_index - 2)
+        end = min(len(entries), current_index + 3)
+        around_me = [_with_current_flag(entry, current_user_id) for entry in entries[start:end]]
+        target_entry = entries[current_index - 1] if current_index > 0 else None
+        chaser_entry = entries[current_index + 1] if current_index + 1 < len(entries) else None
+        current_league = _league_meta(current_user["total_xp"])
+        user_rank = current_user["rank"]
+        current_score = current_user["xp"]
+        current_total_xp = current_user["total_xp"]
+
+    total_learners = len(entries)
+    if total_learners <= 1 or current_index is None:
+        percentile = 100 if total_learners == 1 else 0
+    else:
+        percentile = round(((total_learners - 1 - current_index) / (total_learners - 1)) * 100)
+
+    summary = {
+        **snapshot["meta"],
+        "total_learners": total_learners,
+        "top_score": snapshot["top_score"],
+        "best_streak": snapshot["best_streak"],
+        "user_rank": user_rank,
+        "user_percentile": percentile,
+        "gap_to_target": max(0, (target_entry["xp"] - current_score) if target_entry else 0),
+        "lead_over_chaser": max(0, (current_score - chaser_entry["xp"]) if chaser_entry else 0),
+        "target_name": target_entry["name"] if target_entry else "",
+        "chaser_name": chaser_entry["name"] if chaser_entry else "",
+        "current_league": current_league["current_league"],
+        "next_league": current_league["next_league"],
+        "league_progress": current_league["league_progress"],
+        "next_league_target": current_league["next_league_target"],
+        "score_to_next_league": current_league["score_to_next_league"],
+        "current_score": current_score,
+        "current_total_xp": current_total_xp,
+        "generated_at": snapshot["generated_at"],
+    }
+
+    return {
+        "summary": summary,
+        "current_user": current_user,
+        "podium": podium,
+        "leaderboard": leaderboard,
+        "around_me": around_me,
+    }
 
 
 class RegisterView(generics.CreateAPIView):
@@ -29,7 +290,8 @@ class RegisterView(generics.CreateAPIView):
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
-    throttle_classes = [AnonRateThrottle]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "register"
 
     @extend_schema(
         summary="Inscription",
@@ -64,6 +326,9 @@ class LoginView(TokenObtainPairView):
     """POST /api/v1/auth/login/ — Connexion et obtention des tokens JWT."""
 
     serializer_class = TSpkTokenObtainSerializer
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
 
     @extend_schema(summary="Connexion", description="Authentification avec email + mot de passe.")
     def post(self, request, *args, **kwargs):
@@ -151,24 +416,38 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
 
 
 class LeaderboardView(generics.ListAPIView):
-    """GET /api/v1/auth/leaderboard/ — Classement hebdomadaire."""
+    """GET /api/v1/auth/leaderboard/ — Classement enrichi hebdo/global."""
 
     permission_classes = [permissions.IsAuthenticated]
 
-    @extend_schema(summary="Classement", description="Top 50 utilisateurs par XP.")
+    @extend_schema(
+        summary="Classement",
+        description="Retourne un leaderboard riche avec podium, rang personnel et vue autour du joueur.",
+        parameters=[
+            OpenApiParameter(
+                name="scope",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="`weekly` pour les 7 derniers jours, `global` pour le cumul total.",
+            ),
+        ],
+        responses={200: LeaderboardResponseSerializer},
+    )
     def get(self, request):
-        cache_key = "leaderboard:weekly"
-        data = cache.get(cache_key)
+        scope = request.query_params.get("scope", "weekly").lower()
+        if scope not in {"weekly", "global"}:
+            scope = "weekly"
 
-        if not data:
-            top_users = User.objects.filter(is_active=True).order_by("-xp_total")[:50]
-            ranks = {str(u.id): idx + 1 for idx, u in enumerate(top_users)}
-            data = LeaderboardEntrySerializer(
-                top_users, many=True, context={"request": request, "ranks": ranks}
-            ).data
-            cache.set(cache_key, data, timeout=300)  # Cache 5 min
-
-        return Response({"success": True, "data": data, "count": len(data)})
+        payload = _leaderboard_payload_for_user(request.user, scope)
+        serialized = LeaderboardResponseSerializer(payload).data
+        return Response(
+            {
+                "success": True,
+                "data": serialized,
+                "count": serialized["summary"]["total_learners"],
+            }
+        )
 
 
 @api_view(["POST"])

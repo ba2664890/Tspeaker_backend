@@ -7,7 +7,21 @@ from celery.schedules import crontab
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 
 app = Celery("tspeak")
+
+# Utilisation du namespace 'CELERY' pour charger les réglages (CELERY_BROKER_URL, etc.)
 app.config_from_object("django.conf:settings", namespace="CELERY")
+
+# Forçage si nécessaire pour éviter le fallback par défaut sur RabbitMQ (amqp)
+if not app.conf.broker_url or "amqp" in str(app.conf.broker_url):
+    try:
+        from django.conf import settings
+        if hasattr(settings, "CELERY_BROKER_URL"):
+            app.conf.broker_url = settings.CELERY_BROKER_URL
+        if hasattr(settings, "CELERY_RESULT_BACKEND"):
+            app.conf.result_backend = settings.CELERY_RESULT_BACKEND
+    except Exception:
+        pass
+
 app.autodiscover_tasks()
 
 # ─── Tâches périodiques ───────────────────────────────────────────────────────

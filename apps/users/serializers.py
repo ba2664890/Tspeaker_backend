@@ -108,17 +108,49 @@ class BadgeSerializer(serializers.ModelSerializer):
         fields = ["id", "badge_type", "badge_name", "badge_icon", "earned_at"]
 
 
-class LeaderboardEntrySerializer(serializers.ModelSerializer):
-    rank = serializers.SerializerMethodField()
-    is_current_user = serializers.SerializerMethodField()
+class LeaderboardEntrySerializer(serializers.Serializer):
+    id = serializers.CharField()
+    rank = serializers.IntegerField()
+    name = serializers.CharField()
+    avatar_url = serializers.CharField(allow_blank=True)
+    xp = serializers.IntegerField()
+    total_xp = serializers.IntegerField()
+    level = serializers.CharField()
+    level_number = serializers.IntegerField()
+    league = serializers.CharField()
+    streak_days = serializers.IntegerField()
+    sessions_count = serializers.IntegerField()
+    average_score = serializers.FloatField()
+    is_current_user = serializers.BooleanField()
 
-    class Meta:
-        model = User
-        fields = ["id", "first_name", "last_name", "full_name", "avatar_url", "xp_total", "level", "rank", "is_current_user"]
 
-    def get_rank(self, obj):
-        return self.context.get("ranks", {}).get(str(obj.id), 0)
+class LeaderboardSummarySerializer(serializers.Serializer):
+    scope = serializers.CharField()
+    scope_label = serializers.CharField()
+    scope_description = serializers.CharField()
+    score_label = serializers.CharField()
+    total_learners = serializers.IntegerField()
+    top_score = serializers.IntegerField()
+    best_streak = serializers.IntegerField()
+    user_rank = serializers.IntegerField()
+    user_percentile = serializers.IntegerField()
+    gap_to_target = serializers.IntegerField()
+    lead_over_chaser = serializers.IntegerField()
+    target_name = serializers.CharField(allow_blank=True)
+    chaser_name = serializers.CharField(allow_blank=True)
+    current_league = serializers.CharField()
+    next_league = serializers.CharField(allow_blank=True)
+    league_progress = serializers.FloatField()
+    next_league_target = serializers.IntegerField()
+    score_to_next_league = serializers.IntegerField()
+    current_score = serializers.IntegerField()
+    current_total_xp = serializers.IntegerField()
+    generated_at = serializers.DateTimeField()
 
-    def get_is_current_user(self, obj):
-        request = self.context.get("request")
-        return request and request.user.id == obj.id
+
+class LeaderboardResponseSerializer(serializers.Serializer):
+    summary = LeaderboardSummarySerializer()
+    current_user = LeaderboardEntrySerializer(allow_null=True)
+    podium = LeaderboardEntrySerializer(many=True)
+    leaderboard = LeaderboardEntrySerializer(many=True)
+    around_me = LeaderboardEntrySerializer(many=True)
