@@ -101,6 +101,9 @@ DATABASES = {
 REDIS_URL = config("REDIS_URL", default="redis://127.0.0.1:6379")
 CACHE_BACKEND = config("CACHE_BACKEND", default="redis")
 
+# Nettoyage du REDIS_URL pour éviter les doubles slashes lors de l'ajout de l'index
+_cleaned_redis_url = REDIS_URL.rstrip('/')
+
 if CACHE_BACKEND == "locmem":
     CACHES = {
         "default": {
@@ -117,7 +120,7 @@ else:
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": f"{REDIS_URL}/0",
+            "LOCATION": f"{_cleaned_redis_url}/0",
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
                 "CONNECTION_POOL_KWARGS": {"max_connections": 20},
@@ -125,12 +128,16 @@ else:
                 "SOCKET_TIMEOUT": 5,
             },
             "KEY_PREFIX": "tspeak",
-            "TIMEOUT": 300,  # 5 minutes par défaut
+            "TIMEOUT": 300,
         },
         "sessions": {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": f"{REDIS_URL}/1",
-            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+            "LOCATION": f"{_cleaned_redis_url}/1",
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            },
+            "KEY_PREFIX": "tspeak_sess",
+            "TIMEOUT": 86400, # 24h
         },
     }
 
@@ -138,8 +145,8 @@ SESSION_ENGINE = "django.contrib.sessions.backends.cache"
 SESSION_CACHE_ALIAS = "sessions"
 
 # ─── Celery ──────────────────────────────────────────────────────────────────
-CELERY_BROKER_URL = f"{REDIS_URL}/2"
-CELERY_RESULT_BACKEND = f"{REDIS_URL}/2"
+CELERY_BROKER_URL = f"{_cleaned_redis_url}/2"
+CELERY_RESULT_BACKEND = f"{_cleaned_redis_url}/2"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
