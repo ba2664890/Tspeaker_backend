@@ -15,7 +15,7 @@ SECRET_KEY = config("SECRET_KEY", default="change-me-in-production-please-longer
 DEBUG = config("DEBUG", default=False, cast=bool)
 ALLOWED_HOSTS = config(
     "ALLOWED_HOSTS", 
-    default="localhost,127.0.0.1,tspeak-backend-1.onrender.com", 
+    default="localhost,127.0.0.1,tspeaker-backend-1.onrender.com", 
     cast=Csv()
 )
 # Ajout des domaines Render dynamiquement
@@ -24,7 +24,7 @@ if RENDER_EXTERNAL_HOSTNAME:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://tspeak-backend-1.onrender.com",
+    "https://tspeaker-backend-1.onrender.com",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ]
