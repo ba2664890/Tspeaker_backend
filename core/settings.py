@@ -13,7 +13,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ─── Sécurité ───────────────────────────────────────────────────────────────
 SECRET_KEY = config("SECRET_KEY", default="change-me-in-production-please-longer-key-32-chars")
 DEBUG = config("DEBUG", default=False, cast=bool)
-ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="localhost,127.0.0.1", cast=Csv())
+ALLOWED_HOSTS = config(
+    "ALLOWED_HOSTS", 
+    default="localhost,127.0.0.1,tspeak-backend-1.onrender.com", 
+    cast=Csv()
+)
+# Ajout des domaines Render dynamiquement
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_EXTERNAL_HOSTNAME:
+    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://tspeak-backend-1.onrender.com",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
 
 # ─── Applications ────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
@@ -72,12 +86,15 @@ TEMPLATES = [
     },
 ]
 
+import dj_database_url
+
 # ─── Base de données ─────────────────────────────────────────────────────────
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
+    "default": dj_database_url.config(
+        default=f'sqlite:///{BASE_DIR / "db.sqlite3"}',
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
 }
 
 # ─── Cache & Redis ───────────────────────────────────────────────────────────
