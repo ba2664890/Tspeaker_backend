@@ -231,8 +231,14 @@ REDIS_URL=redis://localhost:6379
 # IA Models
 WHISPER_MODEL=medium          # tiny/base/small/medium/large
 WHISPER_DEVICE=cpu            # cpu/cuda
+WHISPER_COMPUTE_TYPE=default  # default/int8/float16
 WHISPER_FINE_TUNED_PATH=./models/whisper-african  # Optionnel
-WAV2VEC_MODEL=facebook/wav2vec2-large-xlsr-53
+WAV2VEC_MODEL=facebook/wav2vec2-base-960h
+WAV2VEC_DEVICE=cpu            # cpu/cuda
+WAV2VEC_MAX_AUDIO_SECONDS=120
+AUDIO_PROCESSING_MODE=async   # async/sync
+AUDIO_INLINE_FALLBACK_ENABLED=True
+AUDIO_INLINE_FALLBACK_AFTER_SECONDS=8
 LLM_API_KEY=sk-...            # OpenAI ou compatible
 
 # Stockage (optionnel, sinon local)

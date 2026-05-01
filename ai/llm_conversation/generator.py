@@ -111,6 +111,16 @@ FEEDBACK_TEMPLATES = {
 }
 
 
+from pydantic import BaseModel, Field
+
+class FeedbackSchema(BaseModel):
+    feedback: str = Field(description="Constructive feedback on user's response")
+    pronunciation_tip: str = Field(description="Specific tip for pronunciation")
+    grammar_correction: str = Field(description="Grammatical correction if needed")
+    next_question: str = Field(description="Follow-up question")
+    encouragement: str = Field(description="Motivational phrase")
+
+
 class ConversationGenerator:
     """
     Générateur de conversations et feedback pour T.Speak.
@@ -120,15 +130,17 @@ class ConversationGenerator:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o-mini",
-        base_url: str = "https://api.openai.com/v1",
+        model: str = "mistralai/Mistral-7B-Instruct-v0.3",
+        base_url: str = "https://router.huggingface.co/v1",
     ):
         self.model = model
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.api_key = api_key or self._get_api_key()
-        self.client = httpx.Client(timeout=30.0)
+        # Detect provider — json_object response_format is only supported by OpenAI
+        self._is_openai = "openai.com" in self.base_url
+        self.client = httpx.Client(timeout=60.0)
 
-        logger.info("ConversationGenerator initialisé: model=%s", model)
+        logger.info("ConversationGenerator initialisé: model=%s base_url=%s", model, self.base_url)
 
     def _get_api_key(self) -> str:
         try:
@@ -152,25 +164,6 @@ class ConversationGenerator:
     ) -> dict:
         """
         Génère le feedback et la prochaine question de l'IA.
-
-        Args:
-            user_transcription: Ce que l'utilisateur a dit (transcrit par Whisper)
-            ai_question: La question que l'IA avait posée
-            pronunciation_score: Score prononciation (0-100) de Wav2Vec
-            fluency_score: Score fluidité calculé
-            native_language: Langue maternelle de l'utilisateur
-            session_type: Type de session
-            history: Historique des 10 derniers échanges
-            user_level: Niveau de l'utilisateur
-
-        Returns:
-            {
-                "feedback": str,
-                "next_question": str,
-                "grammar_correction": str,
-                "pronunciation_tip": str,
-                "encouragement": str,
-            }
         """
         start_time = time.monotonic()
 
@@ -179,7 +172,7 @@ class ConversationGenerator:
             session_type, user_level, native_language, scenario
         )
 
-        # Construire les messages avec historique (contexte fenêtre de 10)
+        # Construire les messages avec historique
         messages = self._build_messages(
             system_prompt=system_prompt,
             user_transcription=user_transcription,
@@ -222,54 +215,72 @@ class ConversationGenerator:
         fluency_score: float,
         history: list,
     ) -> list[dict]:
-        """Construit la liste de messages pour l'API LLM."""
-        messages = [{"role": "system", "content": system_prompt}]
+        """Construit la liste de messages pour l'API LLM avec protection par délimiteurs."""
+        messages = [{"role": "system", "content": system_prompt + "\n\nCRITICAL: You MUST respond with a raw JSON object only."}]
 
-        # Ajouter l'historique (max 10 échanges)
-        for exchange in history[-10:]:
-            messages.append({"role": "assistant", "content": exchange.get("ai_question", "")})
-            messages.append({"role": "user", "content": exchange.get("transcription", "")})
+        # Ajouter l'historique
+        for exchange in history[-5:]: 
+            ai_q = exchange.get("ai_question", "")
+            user_t = exchange.get("transcription", "")
+            if ai_q: messages.append({"role": "assistant", "content": ai_q})
+            if user_t: messages.append({"role": "user", "content": f"[USER_INPUT]\n{user_t}\n[/USER_INPUT]"})
 
-        # Message current avec contexte scores
-        user_message = f"""Previous question: "{ai_question}"
+        # Message current
+        user_message_content = f"""[CONTEXT]
+Previous question: "{ai_question}"
+Pronunciation score: {pronunciation_score:.0f}/100
+Fluency score: {fluency_score:.0f}/100
+[/CONTEXT]
 
-User's response (transcribed): "{user_transcription}"
+[USER_INPUT]
+{user_transcription}
+[/USER_INPUT]
 
-AI scoring context:
-- Pronunciation score: {pronunciation_score:.0f}/100
-- Fluency score: {fluency_score:.0f}/100
+Generate feedback in JSON format following the schema: feedback, pronunciation_tip, grammar_correction, next_question, encouragement."""
 
-Please respond in this JSON format:
-{{
-  "feedback": "Your feedback on the user's response (1-2 sentences, constructive and encouraging)",
-  "pronunciation_tip": "Specific pronunciation tip if score < 75, else 'Great pronunciation!'",
-  "grammar_correction": "Correct grammar if needed, or 'Grammar looks good!'",
-  "next_question": "Your next question or response to continue the conversation",
-  "encouragement": "One short motivational phrase in English (5-10 words)"
-}}"""
-
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": user_message_content})
         return messages
 
+    def _parse_response(self, response_text: str, pronunciation_score: float) -> dict:
+        """Parse la réponse JSON avec robustesse (Regex + Pydantic)."""
+        import re
+        try:
+            # Extraction du bloc JSON si entouré de texte
+            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            json_str = json_match.group(0) if json_match else response_text
+            
+            parsed = FeedbackSchema.model_validate_json(json_str)
+            return parsed.model_dump()
+        except Exception as e:
+            logger.warning("Erreur parsing LLM (%s): %s", e, response_text[:100])
+            return self._fallback_response(response_text, pronunciation_score)
+
     def _call_llm(self, messages: list[dict]) -> str:
-        """Appelle l'API LLM externe."""
+        """Appelle l'API LLM externe (compatible OpenAI / HuggingFace Inference)."""
+        if not self.api_key:
+            raise ValueError("LLM_API_KEY non configurée")
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict = {
             "model": self.model,
             "messages": messages,
             "max_tokens": 500,
             "temperature": 0.7,
-            "response_format": {"type": "json_object"},
         }
+        # json_object response_format is only supported by OpenAI-compatible endpoints
+        if self._is_openai:
+            payload["response_format"] = {"type": "json_object"}
 
         response = self.client.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
             json=payload,
         )
+        if response.status_code != 200:
+            logger.error("Détails erreur LLM (%d): %s", response.status_code, response.text)
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"]
@@ -374,6 +385,7 @@ def get_generator() -> ConversationGenerator:
         from django.conf import settings
         _generator_instance = ConversationGenerator(
             api_key=getattr(settings, "LLM_API_KEY", ""),
-            model=getattr(settings, "LLM_MODEL", "gpt-4o-mini"),
+            model=getattr(settings, "LLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.3"),
+            base_url=getattr(settings, "LLM_BASE_URL", "https://router.huggingface.co/v1"),
         )
     return _generator_instance

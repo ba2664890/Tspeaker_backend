@@ -8,6 +8,9 @@ from pathlib import Path
 from datetime import timedelta
 from decouple import config, Csv
 
+# Fix for TensorFlow / Protobuf "MessageFactory object has no attribute GetPrototype" error
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ─── Sécurité ───────────────────────────────────────────────────────────────
@@ -163,6 +166,12 @@ CELERY_TIMEZONE = "Africa/Dakar"
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 300  # 5 min max par tâche audio
 CELERY_WORKER_CONCURRENCY = 4
+# Import explicite de tous les modules de tâches pour garantir l'enregistrement
+CELERY_IMPORTS = [
+    "apps.sessions.tasks",
+    "apps.progress.tasks",
+    "apps.scoring.tasks",
+]
 
 # ─── DRF ────────────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
@@ -241,10 +250,17 @@ AUDIO_DELETE_AFTER_PROCESSING = True  # RGPD : suppression après 24h
 # ─── Configuration IA ────────────────────────────────────────────────────────
 WHISPER_MODEL = config("WHISPER_MODEL", default="medium")
 WHISPER_DEVICE = config("WHISPER_DEVICE", default="cpu")  # "cuda" pour GPU
+WHISPER_COMPUTE_TYPE = config("WHISPER_COMPUTE_TYPE", default="default")
 WHISPER_FINE_TUNED_PATH = config("WHISPER_FINE_TUNED_PATH", default=None)
-WAV2VEC_MODEL = config("WAV2VEC_MODEL", default="facebook/wav2vec2-large-xlsr-53")
+WAV2VEC_MODEL = config("WAV2VEC_MODEL", default="facebook/wav2vec2-base-960h")
+WAV2VEC_DEVICE = config("WAV2VEC_DEVICE", default=WHISPER_DEVICE)
+WAV2VEC_MAX_AUDIO_SECONDS = config("WAV2VEC_MAX_AUDIO_SECONDS", default=120, cast=int)
+AUDIO_PROCESSING_MODE = config("AUDIO_PROCESSING_MODE", default="async")
+AUDIO_INLINE_FALLBACK_ENABLED = config("AUDIO_INLINE_FALLBACK_ENABLED", default=True, cast=bool)
+AUDIO_INLINE_FALLBACK_AFTER_SECONDS = config("AUDIO_INLINE_FALLBACK_AFTER_SECONDS", default=8, cast=int)
 LLM_API_KEY = config("LLM_API_KEY", default="")
-LLM_MODEL = config("LLM_MODEL", default="gpt-4o-mini")
+LLM_MODEL = config("LLM_MODEL", default="meta-llama/Meta-Llama-3-8B-Instruct")
+LLM_BASE_URL = config("LLM_BASE_URL", default="https://router.huggingface.co/v1")
 LLM_MAX_TOKENS = 500
 AI_PROCESSING_TIMEOUT = 30  # secondes
 

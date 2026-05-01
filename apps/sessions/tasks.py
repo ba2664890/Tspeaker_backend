@@ -34,6 +34,29 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
     6. Calcul score global
     7. Sauvegarde PostgreSQL + cache Redis
     """
+    try:
+        return process_audio_exchange_now(exchange_id, audio_path, native_language)
+
+    except Exception as exc:
+        logger.error("❌ Erreur traitement audio: exchange=%s — %s", exchange_id, exc, exc_info=True)
+        try:
+            raise self.retry(exc=exc)
+        except Exception:
+            # Marquer la session comme échouée après 3 tentatives
+            try:
+                from apps.sessions.models import AudioExchange
+                exchange = AudioExchange.objects.get(id=exchange_id)
+                exchange.ai_feedback = "Une erreur s'est produite. Veuillez réessayer."
+                exchange.session.status = "active"
+                exchange.save(update_fields=["ai_feedback"])
+                exchange.session.save(update_fields=["status"])
+            except Exception:
+                logger.exception("Impossible de marquer l'échange %s en erreur", exchange_id)
+            return {"status": "error", "message": str(exc)}
+
+
+def process_audio_exchange_now(exchange_id: str, audio_path: str, native_language: str):
+    """Exécute le pipeline audio immédiatement, sans passer par un worker Celery."""
     from apps.sessions.models import AudioExchange
 
     start_time = time.monotonic()
@@ -41,24 +64,38 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
 
     try:
         exchange = AudioExchange.objects.select_related("session__user").get(id=exchange_id)
+        if exchange.transcription:
+            logger.info("Échange déjà traité (skip): %s", exchange_id)
+            return {"status": "success", "already_processed": True}
     except AudioExchange.DoesNotExist:
         logger.error("Échange introuvable: %s", exchange_id)
         return {"status": "error", "message": "Exchange not found"}
 
+    if not os.path.exists(audio_path):
+        # Si le fichier n'existe pas, c'est peut-être qu'un autre worker (ou le fallback)
+        # l'a déjà traité et supprimé. On vérifie la transcription une dernière fois.
+        exchange.refresh_from_db()
+        if exchange.transcription:
+            return {"status": "success", "already_processed": True}
+        logger.error("Fichier audio introuvable (et non traité): %s", audio_path)
+        return {"status": "error", "message": f"Audio file not found: {audio_path}"}
+
+    wav_path = None
+    processing_succeeded = False
     try:
         # ── Étape 1 : Conversion audio ─────────────────────────────────────
         wav_path = _convert_to_wav(audio_path)
 
         # ── Étape 2 : Transcription Whisper ───────────────────────────────
-        from ai.whisper_asr.transcriber import WhisperTranscriber
-        transcriber = WhisperTranscriber()
+        from ai.whisper_asr.transcriber import get_transcriber
+        transcriber = get_transcriber()
         transcription_result = transcriber.transcribe(wav_path, language="en")
         transcription = transcription_result["text"].strip()
         logger.info("Transcription: '%s...'", transcription[:50])
 
         # ── Étape 3 : Scoring Wav2Vec ──────────────────────────────────────
-        from ai.wav2vec_scoring.scorer import Wav2VecScorer
-        scorer = Wav2VecScorer()
+        from ai.wav2vec_scoring.scorer import get_scorer
+        scorer = get_scorer()
         phoneme_analysis = scorer.score_pronunciation(
             wav_path,
             reference_text=exchange.ai_question,
@@ -78,8 +115,8 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
         vocabulary_score = vocabulary_analysis["vocabulary_score"]
 
         # ── Étape 5 : Génération feedback LLM ─────────────────────────────
-        from ai.llm_conversation.generator import ConversationGenerator
-        generator = ConversationGenerator()
+        from ai.llm_conversation.generator import get_generator
+        generator = get_generator()
         session = exchange.session
         history = _get_session_history(session)
 
@@ -118,11 +155,9 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
             },
         )
 
-        # Mettre à jour le statut de la session
         session.status = "active"
         session.save(update_fields=["status"])
 
-        # Cache Redis du résultat (10 minutes)
         result_data = {
             "exchange_id": exchange_id,
             "transcription": transcription,
@@ -144,23 +179,14 @@ def process_audio_exchange(self, exchange_id: str, audio_path: str, native_langu
             "✅ Traitement terminé: exchange=%s — %dms — prononciation=%.1f",
             exchange_id, processing_ms, pronunciation_score,
         )
-
-        # Nettoyage fichiers temporaires (RGPD)
-        _cleanup_audio(wav_path)
-        if audio_path != wav_path:
-            _cleanup_audio(audio_path)
-
+        processing_succeeded = True
         return result_data
 
-    except Exception as exc:
-        logger.error("❌ Erreur traitement audio: exchange=%s — %s", exchange_id, exc, exc_info=True)
-        try:
-            raise self.retry(exc=exc)
-        except Exception:
-            # Marquer la session comme échouée après 3 tentatives
-            exchange.ai_feedback = "Une erreur s'est produite. Veuillez réessayer."
-            exchange.save(update_fields=["ai_feedback"])
-            return {"status": "error", "message": str(exc)}
+    finally:
+        if processing_succeeded and wav_path:
+            _cleanup_audio(wav_path)
+        if processing_succeeded and audio_path != wav_path:
+            _cleanup_audio(audio_path)
 
 
 @shared_task(name="sessions.cleanup_audio_files")

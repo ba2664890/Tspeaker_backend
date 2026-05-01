@@ -8,6 +8,7 @@ import os
 import uuid
 from datetime import timedelta
 
+from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone
 from rest_framework import generics, status, permissions
@@ -148,31 +149,70 @@ class AudioUploadView(generics.GenericAPIView):
             exchange_index=session.exchanges_count,
             ai_question=request.data.get("question", ""),
             user_audio_duration_sec=float(request.data.get("duration_sec", 0)),
+            user_audio_url=temp_path,
         )
-
-        # Envoyer à Celery pour traitement asynchrone
-        task = process_audio_exchange.apply_async(
-            args=[str(exchange.id), temp_path, str(request.user.native_language)],
-            queue="audio",
-            countdown=0,
-        )
-
-        exchange.celery_task_id = task.id
-        exchange.save(update_fields=["celery_task_id"])
 
         session.exchanges_count += 1
         session.status = "processing"
         session.save(update_fields=["exchanges_count", "status"])
 
+        task_id = ""
+        processing_mode = getattr(settings, "AUDIO_PROCESSING_MODE", "async")
+        if processing_mode == "sync":
+            from .tasks import process_audio_exchange_now
+            result_data = process_audio_exchange_now(
+                str(exchange.id), temp_path, str(request.user.native_language)
+            )
+            return Response(
+                {
+                    "success": True,
+                    "exchange_id": str(exchange.id),
+                    "status": "completed",
+                    "data": result_data,
+                    "message": "Audio traité avec succès.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        try:
+            # Envoyer à Celery pour traitement asynchrone
+            task = process_audio_exchange.apply_async(
+                args=[str(exchange.id), temp_path, str(request.user.native_language)],
+                queue="audio",
+                countdown=0,
+            )
+            task_id = task.id
+            exchange.celery_task_id = task_id
+            exchange.save(update_fields=["celery_task_id"])
+        except Exception as exc:
+            logger.warning(
+                "Celery indisponible, traitement inline: exchange=%s error=%s",
+                exchange.id,
+                exc,
+            )
+            from .tasks import process_audio_exchange_now
+            result_data = process_audio_exchange_now(
+                str(exchange.id), temp_path, str(request.user.native_language)
+            )
+            return Response(
+                {
+                    "success": True,
+                    "exchange_id": str(exchange.id),
+                    "status": "completed",
+                    "data": result_data,
+                    "message": "Audio traité avec succès.",
+                },
+                status=status.HTTP_200_OK,
+            )
         logger.info(
-            "Audio envoyé en traitement: exchange=%s task=%s", exchange.id, task.id
+            "Audio envoyé en traitement: exchange=%s task=%s", exchange.id, task_id
         )
 
         return Response(
             {
                 "success": True,
                 "exchange_id": str(exchange.id),
-                "task_id": task.id,
+                "task_id": task_id,
                 "message": "Audio en cours de traitement. Résultat disponible dans ~2-3 secondes.",
             },
             status=status.HTTP_202_ACCEPTED,
@@ -189,6 +229,14 @@ class AudioResultView(generics.RetrieveAPIView):
         cache_key = f"exchange_result:{exchange_id}"
         cached = cache.get(cache_key)
         if cached:
+            if cached.get("status") == "failed":
+                return Response(
+                    {
+                        "success": False,
+                        "status": "failed",
+                        "error": {"message": cached.get("message", "Traitement impossible.")},
+                    }
+                )
             return Response({"success": True, "status": "completed", "data": cached})
 
         try:
@@ -202,13 +250,37 @@ class AudioResultView(generics.RetrieveAPIView):
             )
 
         if not exchange.transcription:
+            if _exchange_failed(exchange):
+                return Response(
+                    {
+                        "success": False,
+                        "status": "failed",
+                        "error": {
+                            "message": exchange.ai_feedback
+                            or "Le traitement audio a échoué. Réenregistre ta réponse.",
+                        },
+                    }
+                )
+
             # Vérifier le statut Celery
             from celery.result import AsyncResult
             result = AsyncResult(exchange.celery_task_id)
+            try:
+                state = result.state
+            except Exception as exc:
+                logger.warning(
+                    "Statut Celery indisponible, fallback possible: exchange=%s error=%s",
+                    exchange.id,
+                    exc,
+                )
+                state = "PENDING"
+            fallback_response = _maybe_process_exchange_inline(exchange, request.user, state)
+            if fallback_response is not None:
+                return fallback_response
             return Response(
                 {
                     "success": True,
-                    "status": result.state,
+                    "status": state,
                     "message": "Traitement en cours...",
                     "task_id": exchange.celery_task_id,
                 }
@@ -339,6 +411,67 @@ def _save_temp_audio(audio_file, session_id: str) -> str:
         for chunk in audio_file.chunks():
             f.write(chunk)
     return temp_path
+
+
+def _maybe_process_exchange_inline(exchange: AudioExchange, user: User, task_state: str) -> Response | None:
+    """Fallback dev/prod: traite inline si aucun worker ne prend la tâche."""
+    fallback_enabled = getattr(settings, "AUDIO_INLINE_FALLBACK_ENABLED", True)
+    if not fallback_enabled:
+        return None
+    if task_state not in ("PENDING", "FAILURE", "RETRY"):
+        return None
+
+    delay_sec = getattr(settings, "AUDIO_INLINE_FALLBACK_AFTER_SECONDS", 8)
+    age_sec = (timezone.now() - exchange.created_at).total_seconds()
+    if age_sec < delay_sec:
+        return None
+
+    audio_path = exchange.user_audio_url
+    if not audio_path or not os.path.exists(audio_path):
+        message = "Fichier audio temporaire introuvable. Réenregistre ta réponse."
+        exchange.ai_feedback = message
+        exchange.session.status = "active"
+        exchange.save(update_fields=["ai_feedback"])
+        exchange.session.save(update_fields=["status"])
+        cache.set(
+            f"exchange_result:{exchange.id}",
+            {"status": "failed", "message": message},
+            timeout=600,
+        )
+        return Response(
+            {
+                "success": False,
+                "status": "failed",
+                "error": {"message": message},
+            }
+        )
+
+    logger.warning("Fallback inline audio: exchange=%s age=%.1fs", exchange.id, age_sec)
+    from .tasks import process_audio_exchange_now
+    result_data = process_audio_exchange_now(
+        str(exchange.id),
+        audio_path,
+        str(user.native_language),
+    )
+    if result_data.get("status") == "error":
+        return Response(
+            {
+                "success": False,
+                "status": "failed",
+                "error": {"message": result_data.get("message", "Traitement impossible.")},
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response({"success": True, "status": "completed", "data": result_data})
+
+
+def _exchange_failed(exchange: AudioExchange) -> bool:
+    return (
+        not exchange.transcription
+        and bool(exchange.ai_feedback)
+        and exchange.processing_time_ms == 0
+    )
 
 
 def _generate_first_question(session: VocalSession) -> str:

@@ -13,7 +13,6 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -23,12 +22,12 @@ from jiwer import wer
 
 try:
     import Levenshtein
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - dependance declaree, fallback de demarrage.
     Levenshtein = None
 
 try:
     import torch
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - permet a Django de demarrer avant install IA.
     torch = None
 
 logger = logging.getLogger("tspeak.ai")
@@ -62,7 +61,7 @@ class Wav2VecScorer:
     2. Passe l'audio dans un modele Wav2Vec2 CTC anglais.
     3. Decode les tokens avec timestamps et confiances.
     4. Compare reference, transcription Whisper et sortie CTC.
-    5. Retourne score global, details par token/mot et conseils cibles.
+    5. Retourne score global, details par token/mot et conseils ciblés.
     """
 
     MODEL_ID = "facebook/wav2vec2-base-960h"
@@ -82,17 +81,10 @@ class Wav2VecScorer:
         self.max_audio_seconds = max_audio_seconds
         self._model = None
         self._processor = None
-        # Blank token ID pour CTC: pad_token_id pour Wav2Vec2, avec fallback a 0.
-        self._blank_token_id: int = 0
-        # Vocab inverse: int -> token string, cache au chargement du modele.
-        self._id_to_token: dict[int, str] = {}
+        self._blank_token_id: Optional[int] = None
         self._model_lock = threading.Lock()
 
         logger.info("Wav2VecScorer initialise: model=%s device=%s", self.model_id, self.device)
-
-    # ------------------------------------------------------------------
-    # Proprietes avec chargement lazy thread-safe
-    # ------------------------------------------------------------------
 
     @property
     def model(self):
@@ -110,7 +102,7 @@ class Wav2VecScorer:
                     self._load_model()
         return self._processor
 
-    def _load_model(self) -> None:
+    def _load_model(self):
         """Charge le modele Wav2Vec2ForCTC et applique les optimisations CPU/GPU."""
         if torch is None:
             raise RuntimeError(
@@ -135,59 +127,38 @@ class Wav2VecScorer:
         model.eval()
         self._processor = processor
         self._model = model
-
-        # FIX: blank_token_id doit toujours etre un int pour que la comparaison
-        # dans decode_tokens fonctionne. Wav2Vec2 utilise pad_token_id comme
-        # symbole CTC blank; on utilise 0 en dernier recours.
-        pad_id = getattr(processor.tokenizer, "pad_token_id", None)
-        self._blank_token_id = pad_id if isinstance(pad_id, int) else 0
-
-        # PERF: construire le vocab inverse une seule fois ici plutot qu'a chaque
-        # appel de decode_tokens (economise ~32 000 iterations a chaque inference).
-        self._id_to_token = {v: k for k, v in processor.tokenizer.get_vocab().items()}
-
+        self._blank_token_id = getattr(processor.tokenizer, "pad_token_id", None)
         logger.info("Wav2Vec2 charge en %.2fs", time.monotonic() - start)
-
-    # ------------------------------------------------------------------
-    # Chargement audio
-    # ------------------------------------------------------------------
 
     def load_audio(self, audio_path: str) -> np.ndarray:
         """Charge et normalise l'audio en mono float32 16 kHz."""
-        # PERF/QUALITE: sf.read retourne directement (data, samplerate).
-        # L'appel prealable a sf.info() etait redondant et ouvrait le fichier 2x.
-        # On borne la lecture a max_audio_seconds * 16000 frames APRES resampling
-        # en lisant d'abord la duree, mais avec une seule ouverture via sf.SoundFile.
-        with sf.SoundFile(audio_path) as f:
-            native_sr = f.samplerate
-            max_frames = self.max_audio_seconds * native_sr
-            waveform = f.read(frames=max_frames, dtype="float32", always_2d=False)
-
+        info = sf.info(audio_path)
+        sample_rate = int(info.samplerate)
+        waveform, sample_rate = sf.read(
+            audio_path,
+            dtype="float32",
+            always_2d=False,
+            frames=self.max_audio_seconds * sample_rate,
+        )
         if waveform.ndim > 1:
             waveform = waveform.mean(axis=1)
-
-        if native_sr != self.SAMPLE_RATE:
-            gcd = int(np.gcd(native_sr, self.SAMPLE_RATE))
+        if sample_rate != self.SAMPLE_RATE:
+            gcd = np.gcd(sample_rate, self.SAMPLE_RATE)
             waveform = resample_poly(
                 waveform,
                 self.SAMPLE_RATE // gcd,
-                native_sr // gcd,
+                sample_rate // gcd,
             ).astype(np.float32)
-
         if waveform.size == 0:
             raise ValueError("Audio vide ou illisible.")
 
-        # QUALITE: np.asarray() redondant supprime (sf.read retourne deja float32).
+        waveform = np.asarray(waveform, dtype=np.float32)
         peak = float(np.max(np.abs(waveform)))
         if peak > 0:
             waveform = waveform / peak * 0.95
         return waveform
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
-    def extract_logits(self, waveform: np.ndarray) -> "torch.Tensor":
+    def extract_logits(self, waveform: np.ndarray) -> torch.Tensor:
         """Extrait les logits CTC du modele."""
         inputs = self.processor(
             waveform,
@@ -204,26 +175,11 @@ class Wav2VecScorer:
             outputs = self.model(input_values, attention_mask=attention_mask)
         return outputs.logits
 
-    def decode_tokens(
-        self, logits: "torch.Tensor", audio_duration_sec: float
-    ) -> tuple[str, list[TokenSpan]]:
-        """Decode CTC greedy avec collapse des repetitions et timestamps approximes.
-
-        PERF: on calcule argmax directement sur les logits (plus rapide que
-        softmax + argmax), puis on n'extrait le softmax que pour les indices
-        argmax — economie d'un facteur ~vocab_size sur l'allocation memoire.
-        """
-        logits_np = logits[0].detach().cpu().float().numpy()  # (T, V)
-        predicted_ids = logits_np.argmax(axis=1)              # (T,)
-
-        # Softmax numeriquement stable uniquement sur les max-logits.
-        # log-sum-exp trick: P(argmax) = exp(l_max) / sum(exp(l_i))
-        #                              = 1 / (1 + sum_{i!=max} exp(l_i - l_max))
-        # On calcule le denominateur complet pour eviter une approximation.
-        max_logits = logits_np[np.arange(len(predicted_ids)), predicted_ids]  # (T,)
-        shifted = logits_np - max_logits[:, np.newaxis]  # broadcast
-        max_probs = 1.0 / np.exp(np.log(np.sum(np.exp(shifted), axis=1)))     # (T,)
-
+    def decode_tokens(self, logits: torch.Tensor, audio_duration_sec: float) -> tuple[str, list[TokenSpan]]:
+        """Decode CTC greedy avec collapse des repetitions et timestamps approximes."""
+        probs = torch.softmax(logits[0], dim=-1).detach().cpu().numpy()
+        predicted_ids = np.argmax(probs, axis=-1)
+        id_to_token = {v: k for k, v in self.processor.tokenizer.get_vocab().items()}
         time_step_sec = audio_duration_sec / max(1, len(predicted_ids))
 
         collapsed: list[TokenSpan] = []
@@ -231,17 +187,15 @@ class Wav2VecScorer:
         prev_id: Optional[int] = None
 
         for idx, token_id in enumerate(predicted_ids):
-            token_id_int = int(token_id)
-
-            if token_id_int == self._blank_token_id:
+            if token_id == self._blank_token_id:
                 prev_id = None
                 continue
-            if prev_id == token_id_int:
+            if prev_id == token_id:
                 continue
 
-            token = self._id_to_token.get(token_id_int, "")
+            token = id_to_token.get(int(token_id), "")
             if not token or token.startswith("<"):
-                prev_id = token_id_int
+                prev_id = token_id
                 continue
 
             normalized_token = " " if token == "|" else token.lower()
@@ -250,16 +204,12 @@ class Wav2VecScorer:
                 token=normalized_token.strip() or "|",
                 start_sec=idx * time_step_sec,
                 end_sec=(idx + 1) * time_step_sec,
-                probability=float(max_probs[idx]),
+                probability=float(probs[idx, token_id]),
             ))
-            prev_id = token_id_int
+            prev_id = token_id
 
         ctc_text = _normalize_text("".join(transcript_parts))
         return ctc_text, collapsed
-
-    # ------------------------------------------------------------------
-    # Scoring principal
-    # ------------------------------------------------------------------
 
     def score_pronunciation(
         self,
@@ -280,13 +230,7 @@ class Wav2VecScorer:
 
             reference_match = _similarity(normalized_reference, normalized_user)
             ctc_match = _similarity(normalized_user, ctc_text)
-
-            # PERF: calcul des unites phonemiques une seule fois, partage entre
-            # _phoneme_similarity et _identify_difficult_phonemes.
-            ref_units = _text_to_pronunciation_units(normalized_reference)
-            usr_units = _text_to_pronunciation_units(normalized_user)
-
-            phoneme_accuracy = _sequence_similarity(ref_units, usr_units)
+            phoneme_accuracy = self._phoneme_similarity(normalized_reference, normalized_user)
             acoustic_confidence = self._acoustic_confidence(token_spans)
 
             pronunciation_score = _weighted_score(
@@ -296,9 +240,7 @@ class Wav2VecScorer:
                 phoneme_accuracy=phoneme_accuracy,
             )
             word_scores = self._compute_word_scores(normalized_user, token_spans, pronunciation_score)
-            difficult = self._identify_difficult_phonemes(
-                normalized_reference, normalized_user, token_spans
-            )
+            difficult = self._identify_difficult_phonemes(normalized_reference, normalized_user, token_spans)
 
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             logger.info(
@@ -336,9 +278,10 @@ class Wav2VecScorer:
             logger.error("Erreur scoring Wav2Vec: %s", exc, exc_info=True)
             return self._fallback_score(reference_text, user_text, str(exc), start_time)
 
-    # ------------------------------------------------------------------
-    # Methodes internes
-    # ------------------------------------------------------------------
+    def _phoneme_similarity(self, reference_text: str, user_text: str) -> float:
+        reference_units = _text_to_pronunciation_units(reference_text)
+        user_units = _text_to_pronunciation_units(user_text)
+        return _sequence_similarity(reference_units, user_units)
 
     def _acoustic_confidence(self, token_spans: list[TokenSpan]) -> float:
         if not token_spans:
@@ -359,30 +302,20 @@ class Wav2VecScorer:
         hints: list[dict] = []
         reference_upper = reference_text.upper()
         user_upper = user_text.upper()
-        low_confidence: set[str] = {
+        low_confidence = {
             span.token.upper()
             for span in token_spans
             if span.token != "|" and span.probability < 0.55
         }
 
-        # QUALITE: bool() explicite pour eviter le type ambigu bool|set issu de &.
-        candidates: dict[str, bool] = {
-            "TH": bool(
-                ("TH" in reference_upper and "TH" not in user_upper)
-                or ({"T", "S", "Z"} & low_confidence)
-            ),
-            "DH": bool(
-                ("THE" in reference_upper or "THAT" in reference_upper)
-                and ({"D", "Z"} & low_confidence)
-            ),
-            "R":  bool("R"  in reference_upper and "R"  in low_confidence),
-            "W":  bool("W"  in reference_upper and "W"  in low_confidence),
-            "V":  bool("V"  in reference_upper and "V"  in low_confidence),
-            "NG": bool("NG" in reference_upper and "NG" not in user_upper),
-            "H":  bool(
-                reference_upper.startswith("H")
-                and (not user_upper.startswith("H") or "H" in low_confidence)
-            ),
+        candidates = {
+            "TH": ("TH" in reference_upper and "TH" not in user_upper) or {"T", "S", "Z"} & low_confidence,
+            "DH": ("THE" in reference_upper or "THAT" in reference_upper) and {"D", "Z"} & low_confidence,
+            "R": "R" in reference_upper and "R" in low_confidence,
+            "W": "W" in reference_upper and "W" in low_confidence,
+            "V": "V" in reference_upper and "V" in low_confidence,
+            "NG": "NG" in reference_upper and "NG" not in user_upper,
+            "H": reference_upper.startswith("H") and (not user_upper.startswith("H") or "H" in low_confidence),
         }
         for phoneme, is_difficult in candidates.items():
             if is_difficult:
@@ -410,13 +343,7 @@ class Wav2VecScorer:
         cursor = 0
         for word in words:
             letters_needed = len(re.sub(r"[^a-z]", "", word.lower()))
-            # FIX: si letters_needed == 0, on n'avance pas le curseur et on
-            # attribue le score de fallback plutot que de consommer un span
-            # de facon non deterministe.
-            if letters_needed == 0 or cursor >= len(letter_spans):
-                scores[word] = round(fallback_score, 1)
-                continue
-            chunk = letter_spans[cursor:cursor + letters_needed]
+            chunk = letter_spans[cursor:cursor + max(1, letters_needed)]
             cursor += letters_needed
             if chunk:
                 scores[word] = round(float(np.mean([s.probability for s in chunk])) * 100, 1)
@@ -445,15 +372,13 @@ class Wav2VecScorer:
             "phoneme_count": 0,
             "phoneme_scores": [],
             "difficult_phonemes": [],
-            "word_scores": {word: score for word in normalized_user.split()},
+            "word_scores": {
+                word: score for word in normalized_user.split()
+            },
             "processing_ms": int((time.monotonic() - start_time) * 1000),
             "error": error,
         }
 
-
-# ---------------------------------------------------------------------------
-# Utilitaires module-level
-# ---------------------------------------------------------------------------
 
 def _normalize_text(text: str) -> str:
     text = text or ""
@@ -487,9 +412,6 @@ def _sequence_similarity(reference: list[str], hypothesis: list[str]) -> float:
 
 
 def _edit_distance(a: list[str], b: list[str]) -> int:
-    """Distance d'edition optimisee O(min(|a|,|b|)) en memoire."""
-    if len(a) < len(b):
-        a, b = b, a  # garantit que b est la sequence plus courte
     previous = list(range(len(b) + 1))
     for i, item_a in enumerate(a, start=1):
         current = [i]
@@ -503,14 +425,7 @@ def _edit_distance(a: list[str], b: list[str]) -> int:
     return previous[-1]
 
 
-@lru_cache(maxsize=256)
-def _text_to_pronunciation_units(text: str) -> tuple[str, ...]:
-    """Convertit un texte en unites phonemiques (IPA ou graphemes).
-
-    PERF: le decorateur @lru_cache evite de relancer espeak/phonemizer pour
-    le meme texte (typiquement le texte de reference, appele 2-3x par scoring).
-    On retourne un tuple (hashable) pour permettre le cache.
-    """
+def _text_to_pronunciation_units(text: str) -> list[str]:
     try:
         from phonemizer import phonemize
         from phonemizer.separator import Separator
@@ -526,13 +441,13 @@ def _text_to_pronunciation_units(text: str) -> tuple[str, ...]:
         )
         units = [unit for unit in phonemes.split() if unit != "|"]
         if units:
-            return tuple(units)
+            return units
     except Exception:
         pass
 
     normalized = _normalize_text(text)
     # Fallback graphemique: moins fin que l'IPA, mais stable et sans dependance systeme.
-    return tuple(char for char in normalized.replace(" ", "|"))
+    return [char for char in normalized.replace(" ", "|")]
 
 
 def _weighted_score(
@@ -543,63 +458,37 @@ def _weighted_score(
 ) -> float:
     score = (
         acoustic_confidence * 0.35
-        + reference_match   * 0.30
-        + phoneme_accuracy  * 0.25
-        + ctc_match         * 0.10
+        + reference_match * 0.30
+        + phoneme_accuracy * 0.25
+        + ctc_match * 0.10
     ) * 100
     return round(float(np.clip(score, 0.0, 100.0)), 2)
 
 
-def _average_token_probability(phoneme: str, token_spans: list[TokenSpan]) -> float:
-    """Probabilite moyenne des spans dont le token appartient au phoneme donne.
-
-    FIX: la condition etait inversee. On cherche les spans dont le token est
-    CONTENU dans le phoneme cible (ex: 'T' in 'TH'), pas l'inverse.
-    """
-    values = [
-        span.probability
-        for span in token_spans
-        if span.token != "|" and span.token.upper() in phoneme
-    ]
+def _average_token_probability(token: str, token_spans: list[TokenSpan]) -> float:
+    values = [span.probability for span in token_spans if span.token.upper() in token]
     return float(np.mean(values)) if values else 0.0
 
-
-# ---------------------------------------------------------------------------
-# Singleton Django-aware
-# ---------------------------------------------------------------------------
 
 _scorer_instance: Optional[Wav2VecScorer] = None
 _scorer_lock = threading.Lock()
 
 
 def get_scorer() -> Wav2VecScorer:
-    """Retourne l'instance singleton du scoreur (lazy, thread-safe)."""
+    """Retourne l'instance singleton du scoreur."""
     global _scorer_instance
     if _scorer_instance is None:
         with _scorer_lock:
             if _scorer_instance is None:
-                _scorer_instance = _build_scorer_from_settings()
+                from django.conf import settings
+
+                _scorer_instance = Wav2VecScorer(
+                    model_id=getattr(settings, "WAV2VEC_MODEL", Wav2VecScorer.MODEL_ID),
+                    device=getattr(settings, "WAV2VEC_DEVICE", None),
+                    max_audio_seconds=getattr(
+                        settings,
+                        "WAV2VEC_MAX_AUDIO_SECONDS",
+                        Wav2VecScorer.MAX_AUDIO_SECONDS,
+                    ),
+                )
     return _scorer_instance
-
-
-def _build_scorer_from_settings() -> Wav2VecScorer:
-    """Instancie le scoreur a partir de django.conf.settings si disponible,
-    sinon utilise les valeurs par defaut de la classe.
-
-    Separer cette logique de get_scorer() permet de tester la factory sans
-    avoir un projet Django configure.
-    """
-    try:
-        from django.conf import settings as django_settings
-        return Wav2VecScorer(
-            model_id=getattr(django_settings, "WAV2VEC_MODEL", Wav2VecScorer.MODEL_ID),
-            device=getattr(django_settings, "WAV2VEC_DEVICE", None),
-            max_audio_seconds=getattr(
-                django_settings,
-                "WAV2VEC_MAX_AUDIO_SECONDS",
-                Wav2VecScorer.MAX_AUDIO_SECONDS,
-            ),
-        )
-    except Exception:
-        # Django non configure (tests unitaires, scripts standalone, etc.)
-        return Wav2VecScorer()
