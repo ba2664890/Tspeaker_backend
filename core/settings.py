@@ -16,20 +16,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ─── Sécurité ───────────────────────────────────────────────────────────────
 SECRET_KEY = config("SECRET_KEY", default="change-me-in-production-please-longer-key-32-chars")
 DEBUG = config("DEBUG", default=False, cast=bool)
-ALLOWED_HOSTS = config(
-    "ALLOWED_HOSTS", 
-    default="localhost,127.0.0.1,tspeaker-backend-1.onrender.com", 
-    cast=Csv()
-)
+ALLOWED_HOSTS = ["*"]
+
 # Ajout des domaines Render dynamiquement
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if RENDER_EXTERNAL_HOSTNAME:
-    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+    ALLOWED_HOSTS = ["*"]
 
 CSRF_TRUSTED_ORIGINS = [
+    "https://focusing-tim-harris-solving.trycloudflare.com",
+    "http://localhost:8001",
+    "http://127.0.0.1:8001",
+    "https://*.trycloudflare.com",
     "https://tspeaker-backend-1.onrender.com",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
 ]
 
 # ─── Applications ────────────────────────────────────────────────────────────
@@ -209,11 +208,7 @@ SIMPLE_JWT = {
 }
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
-CORS_ALLOWED_ORIGINS = config(
-    "CORS_ALLOWED_ORIGINS",
-    default="http://localhost:3000,http://localhost:8080,http://127.0.0.1:3000,http://127.0.0.1:8080",
-    cast=Csv(),
-)
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "accept", "accept-encoding", "authorization",
